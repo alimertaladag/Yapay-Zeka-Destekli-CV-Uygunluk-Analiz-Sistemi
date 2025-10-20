@@ -1,0 +1,34 @@
+👁️ Yapay Zeka Destekli CV Uygunluk Analiz Sistemi
+Bu proje, bir CV'nin (Özgeçmiş) hem içerik hem de yapısal düzen açısından belirli bir iş ilanına ne kadar uygun olduğunu analiz eden Python tabanlı basit bir web uygulamasıdır. Sistem, Doğal Dil İşleme (NLP) tekniklerini kullanarak anahtar kelime eşleşmesi yapar ve basit kural tabanlı bir mekanizma ile CV'nin genel görsel/yapısal kalitesini (görüntü simülasyonu) puanlar.
+🌟 Özellikler
+Dinamik İlan Analizi: Kullanıcı tarafından girilen iş ilanına göre CV'yi değerlendirme.
+İçerik Uygunluğu: TF-IDF ve Kosinüs Benzerliği ile anahtar kelime eşleşme puanı.
+Yapısal Kalite Simülasyonu: CV uzunluğu ve ana başlıkların (Deneyim, Eğitim vb.) varlığına dayalı puanlama (Basit görsel analiz simülasyonu).
+Basit Frontend: Jinja2 kullanmayan, stabil, Flask tabanlı kullanıcı arayüzü.
+🚀 Kurulum ve Çalıştırma
+Aşağıdaki adımları takip ederek projeyi yerel ortamınızda çalıştırabilirsiniz.
+Ön Koşullar
+Python 3.8+ kurulu olmalıdır.
+Adım 1: Sanal Ortam Oluşturma
+python -m venv venv
+source venv/bin/activate   # Linux/macOS
+.\venv\Scripts\activate    # Windows
+
+
+Adım 2: Bağımlılıkları Yükleme
+Projenin çalışması için gerekli olan kütüphaneleri requirements.txt dosyasından yükleyin.
+pip install -r requirements.txt
+
+
+Adım 3: SpaCy Dil Modelini İndirme
+NLP işlemleri için gerekli olan İngilizce temel dil modelini indirin:
+python -m spacy download en_core_web_sm
+
+
+Adım 4: Uygulamayı Çalıştırma
+Ana uygulama dosyasını çalıştırın:
+python vision_cv_analyzer.py
+
+
+Uygulama başlatıldıktan sonra tarayıcınızda şu adrese gidin:
+[http://127.0.0.1:5000](http://127.0.0.1:5000)
