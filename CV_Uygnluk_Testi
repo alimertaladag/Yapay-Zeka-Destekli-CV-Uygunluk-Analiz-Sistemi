@@ -1,0 +1,362 @@
+import os
+import tempfile
+import re
+from flask import Flask, request, redirect, url_for
+import spacy
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+import PyPDF2
+
+# --- 1. Uygulama Ayarları ve Modeller ---
+app = Flask(__name__)
+
+# Flask için dosya yükleme ayarları
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB limit
+ALLOWED_EXTENSIONS = {'pdf'}
+MIN_JOB_DESC_LENGTH = 50  # Minimum ilan metni uzunluğu
+
+# SpaCy dil modelini yükle (İngilizce CV'ler için temel model)
+try:
+    # Modelin yüklenmesi kritik olduğu için globalde tutuyoruz
+    nlp = spacy.load("en_core_web_sm")
+    print("SpaCy modeli başarıyla yüklendi.")
+except OSError:
+    print(
+        "HATA: SpaCy 'en_core_web_sm' modeli bulunamadı. Lütfen terminalde 'python -m spacy download en_core_web_sm' komutunu çalıştırın.")
+    exit()
+
+# --- 2. Yardımcı Fonksiyonlar (NLP ve Skorlama) ---
+
+# CV'de aradığımız genel Türkçe/İngilizce başlıklar (Yapısal puanlama için)
+CV_HEADERS_TR_EN = {
+    'experience': ['deneyim', 'experience', 'iş tecrübesi'],
+    'education': ['eğitim', 'education', 'okul'],
+    'skills': ['beceriler', 'skills', 'yetenekler'],
+    'projects': ['projeler', 'projects'],
+    'contact': ['iletişim', 'contact', 'telefon', 'email']
+}
+
+
+def allowed_file(filename):
+    """Dosya uzantısının izin verilen listede olup olmadığını kontrol eder."""
+    return '.' in filename and \
+        filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+def extract_text_from_pdf(pdf_path):
+    """PyPDF2 kullanarak PDF dosyasından metin çıkarır."""
+    text = ""
+    try:
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            for page in reader.pages:
+                text += page.extract_text() or ''
+    except Exception as e:
+        print(f"PDF okuma hatası: {e}")
+        return None
+    return text.strip()
+
+
+def preprocess_and_extract_keywords(text):
+    """
+    Metni ön işler, anahtar kelimeleri çıkarır ve köklerini (lemma) döndürür.
+    """
+    if not text:
+        return []
+
+    text = text.lower()
+    doc = nlp(text)
+
+    keywords = []
+
+    for token in doc:
+        # Stop words, noktalama işaretleri, boşluklar, sayılar ve kısa kelimeleri atla
+        is_junk = token.is_stop or token.is_punct or token.is_space or token.like_num or len(token.text) < 2
+        # Sadece İsim (NOUN), Sıfat (ADJ) ve Fiilleri (VERB) tut
+        is_relevant_pos = token.pos_ in ['NOUN', 'ADJ', 'VERB']
+
+        if not is_junk and is_relevant_pos:
+            keywords.append(token.lemma_)
+
+    return keywords
+
+
+def calculate_structural_score(raw_cv_text):
+    """
+    CV'nin uzunluğunu, sayfa sayısını ve ana başlıkların varlığını analiz ederek
+    görsel ve yapısal kalitesini simüle eder. (0-100 arasında bir puan)
+    """
+    score = 0
+    text_length = len(raw_cv_text)
+
+    # 1. Uzunluk Puanı (Max 30 Puan)
+    # Optimum uzunluk: 500-2000 karakter arası (1-2 sayfa PDF)
+    if 500 <= text_length <= 2500:
+        score += 30
+    elif 200 <= text_length < 500 or 2500 < text_length <= 4000:
+        score += 15
+
+    # 2. Ana Başlık Varlığı Puanı (Max 70 Puan)
+    # CV'nin düzenli ve yapılandırılmış olduğunu varsayıyoruz
+    found_headers = set()
+    raw_text_lower = raw_cv_text.lower()
+
+    # Her ana kategori için (deneyim, eğitim, beceriler) CV'yi kontrol et
+    for category, headers in CV_HEADERS_TR_EN.items():
+        for header in headers:
+            # Başına ve sonuna boşluk/satır sonu eklemek, kelimenin tam başlık olduğunu varsayarız.
+            if re.search(r'\b' + re.escape(header) + r'\b', raw_text_lower):
+                found_headers.add(category)
+                break
+
+    # Bulunan başlık sayısına göre puanlama (Max 5 kategori * 14 puan)
+    score += len(found_headers) * 14
+
+    # Nihai yapısal puanı 0-100 arasında normalize et
+    return min(100, max(0, score))
+
+
+def calculate_similarity_score(cv_keywords, job_keywords):
+    """
+    Sadece anahtar kelime uygunluğunu (NLP) hesaplar. (0-100 arasında bir puan)
+    """
+    if not cv_keywords or not job_keywords:
+        return 0, [], []
+
+    cv_text = ' '.join(cv_keywords)
+    job_text = ' '.join(job_keywords)
+
+    vectorizer = TfidfVectorizer()
+    corpus = [cv_text, job_text]
+    tfidf_matrix = vectorizer.fit_transform(corpus)
+
+    cosine_sim = cosine_similarity(tfidf_matrix[0:1], tfidf_matrix[1:2])[0][0]
+
+    cv_set = set(cv_keywords)
+    job_set = set(job_keywords)
+
+    matching_keywords = sorted(list(cv_set.intersection(job_set)))
+    missing_keywords = sorted(list(job_set.difference(cv_set)))
+
+    score = round(cosine_sim * 100, 2)
+
+    return score, matching_keywords, missing_keywords
+
+
+# --- 3. HTML Şablonları (Basit, Jinja'sız) ---
+
+def generate_base_html(content):
+    """Tüm sayfalar için ana HTML yapısını oluşturur."""
+    return f"""
+    <!DOCTYPE html>
+    <html lang="tr">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>CV Analiz Sistemi - Görüntü/Yapısal Puanlama</title>
+        <!-- Tailwind CSS CDN -->
+        <script src="https://cdn.tailwindcss.com"></script>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+            body {{
+                font-family: 'Inter', sans-serif;
+                background-color: #f3f4f6;
+            }}
+        </style>
+    </head>
+    <body class="min-h-screen flex items-center justify-center p-4">
+        <div class="w-full max-w-4xl bg-white shadow-2xl rounded-xl p-8 md:p-10 border border-gray-200">
+            <h1 class="text-3xl font-extrabold text-gray-900 mb-8 text-center border-b pb-4">
+                👁️ Yapay Zeka Destekli CV Uygunluk Puanlama (Yapısal Odaklı)
+            </h1>
+            {content}
+        </div>
+    </body>
+    </html>
+    """
+
+
+def generate_index_content(error=None):
+    """Ana sayfa form içeriğini oluşturur."""
+    error_html = ""
+    if error:
+        error_html = f"""
+        <div class="mt-4 p-3 bg-red-100 text-red-700 rounded-lg font-medium text-sm border border-red-300">
+            🚨 Hata: {error}
+        </div>
+        """
+
+    return f"""
+    <div class="text-center mb-8">
+        <p class="text-gray-600">CV'niz hem içerik hem de yapısal düzen açısından (görüntü simülasyonu) değerlendirilecektir.</p>
+    </div>
+
+    <form method="POST" action="{url_for('analyze')}" enctype="multipart/form-data" class="space-y-6">
+
+        <!-- 1. İş İlanı Metni Girişi -->
+        <div class="bg-indigo-50 p-4 rounded-lg border border-indigo-200">
+            <label for="job_description" class="block text-lg font-bold text-indigo-800 mb-2">1. İş İlanı Metni</label>
+            <textarea name="job_description" id="job_description" rows="6" required
+                      placeholder="İş ilanının metnini buraya yapıştırın..."
+                      class="w-full p-3 border border-indigo-300 rounded-md focus:ring-indigo-500 focus:border-indigo-500 shadow-inner text-gray-700"></textarea>
+        </div>
+
+        <!-- 2. CV Dosyası Yükleme -->
+        <div class="bg-green-50 p-4 rounded-lg border border-green-200">
+            <label for="file" class="block text-lg font-bold text-green-800 mb-2">2. PDF CV Dosyası</label>
+            <input type="file" name="file" id="file" required accept=".pdf" 
+                   class="block w-full text-base text-gray-700 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-green-100 file:text-green-700 hover:file:bg-green-200 cursor-pointer">
+        </div>
+
+        <button type="submit" 
+                class="w-full py-3 px-4 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-md transition duration-200">
+            Analizi Başlat (Yapı + İçerik)
+        </button>
+    </form>
+    {error_html}
+    """
+
+
+def generate_result_content(final_score, keyword_score, structural_score, matching_keywords, missing_keywords):
+    """Sonuç sayfasının içeriğini Python'da dinamik olarak oluşturur."""
+
+    # Eşleşen kelimeleri HTML'e çevir
+    matching_list_html = "".join(
+        [f'<span class="px-2 py-0.5 bg-green-100 text-green-700 rounded-full">{k}</span>' for k in matching_keywords])
+    if not matching_keywords:
+        matching_list_html = '<p class="text-gray-500 italic text-sm">Hiçbir anahtar kelime eşleşmesi bulunamadı.</p>'
+
+    # Eksik kelimeleri HTML'e çevir
+    missing_list_html = "".join(
+        [f'<span class="px-2 py-0.5 bg-red-100 text-red-700 rounded-full">{k}</span>' for k in missing_keywords])
+    if not missing_keywords:
+        missing_list_html = '<p class="text-gray-500 italic text-sm">CV\'niz, ilanın tüm önemli becerilerini kapsıyor!</p>'
+
+    return f"""
+    <div class="text-center mb-6">
+        <h2 class="text-2xl font-bold text-indigo-700">✅ Analiz Sonuçları</h2>
+        <p class="text-sm text-gray-500 mt-1">Nihai Puan = (%80 İçerik Uygunluğu) + (%20 Yapısal Kalite)</p>
+    </div>
+
+    <!-- Nihai Puan -->
+    <div class="bg-indigo-50 p-6 rounded-lg shadow-inner mb-6 text-center border border-indigo-200">
+        <p class="text-xl font-semibold text-gray-700 mb-2">NİHAİ UYGUNLUK PUANI</p>
+        <p class="text-6xl font-black text-indigo-600">{final_score}%</p>
+        <div class="mt-4 w-full bg-indigo-200 rounded-full h-3">
+            <div class="bg-indigo-600 h-3 rounded-full" style="width: {final_score}%"></div>
+        </div>
+    </div>
+
+    <!-- Alt Puanlar -->
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+        <div class="p-4 rounded-lg bg-blue-50 border border-blue-200 text-center">
+            <h3 class="text-lg font-bold text-blue-700">İçerik Uygunluğu (NLP)</h3>
+            <p class="text-4xl font-black text-blue-600">{keyword_score}%</p>
+            <p class="text-xs text-gray-500">İlan kelimelerine ne kadar benzediği.</p>
+        </div>
+        <div class="p-4 rounded-lg bg-yellow-50 border border-yellow-200 text-center">
+            <h3 class="text-lg font-bold text-yellow-700">Yapısal Kalite (Simülasyon)</h3>
+            <p class="text-4xl font-black text-yellow-600">{structural_score}%</p>
+            <p class="text-xs text-gray-500">CV uzunluğu ve ana başlık düzeni (Görüntü Simülasyonu).</p>
+        </div>
+    </div>
+
+    <div class="space-y-4">
+        <!-- Eşleşen Anahtar Kelimeler -->
+        <div class="p-4 rounded-lg bg-green-50 border border-green-200">
+            <h3 class="text-lg font-semibold text-green-700 mb-2">🎯 Eşleşen Kelimeler ({len(matching_keywords)})</h3>
+            <div class="flex flex-wrap gap-2 text-sm">
+                {matching_list_html}
+            </div>
+        </div>
+
+        <!-- Eksik Anahtar Kelimeler -->
+        <div class="p-4 rounded-lg bg-red-50 border border-red-200">
+            <h3 class="text-lg font-semibold text-red-700 mb-2">⚠️ Eksik Kelimeler ({len(missing_keywords)})</h3>
+            <div class="flex flex-wrap gap-2 text-sm">
+                {missing_list_html}
+            </div>
+        </div>
+    </div>
+
+    <div class="mt-6 text-center">
+        <a href="{url_for('index')}" class="inline-block py-2 px-6 bg-gray-600 hover:bg-gray-700 text-white font-medium rounded-lg transition duration-150">
+            Yeni Analiz Yap
+        </a>
+    </div>
+    """
+
+
+# --- 4. Flask Yönlendiriciler (Routes) ---
+
+@app.route('/', methods=['GET'])
+def index():
+    """Ana sayfa: İş İlanı metni ve PDF yükleme formunu gösterir."""
+    content = generate_index_content(error=None)
+    return generate_base_html(content)
+
+
+@app.route('/analyze', methods=['POST'])
+def analyze():
+    """Yüklenen dosyayı ve ilan metnini alır, analiz eder ve sonucu gösterir."""
+
+    file = request.files.get('file')
+    job_description = request.form.get('job_description', '')
+
+    # Giriş Kontrolleri
+    if not file or file.filename == '':
+        return generate_base_html(generate_index_content(error="Lütfen CV dosyanızı yükleyin."))
+
+    if not job_description or len(job_description) < MIN_JOB_DESC_LENGTH:
+        return generate_base_html(generate_index_content(
+            error=f"Lütfen en az {MIN_JOB_DESC_LENGTH} karakter uzunluğunda bir İş İlanı Metni girin."))
+
+    if not allowed_file(file.filename):
+        return generate_base_html(
+            generate_index_content(error="Geçersiz dosya uzantısı. Lütfen sadece PDF dosyası yükleyin."))
+
+    # Dosya İşleme
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_file:
+        temp_path = temp_file.name
+        file.save(temp_path)
+
+    try:
+        # 1. Metin Çıkarma (CV)
+        raw_cv_text = extract_text_from_pdf(temp_path)
+
+        if not raw_cv_text or len(raw_cv_text.strip()) < 50:
+            return generate_base_html(generate_index_content(
+                error="PDF'ten anlamlı metin çıkarılamadı. Dosya taranmış bir görsel/resim CV olabilir."))
+
+        # 2. Anahtar Kelime Çıkarma
+        cv_keywords = preprocess_and_extract_keywords(raw_cv_text)
+        job_keywords = preprocess_and_extract_keywords(job_description)
+
+        if not job_keywords:
+            return generate_base_html(generate_index_content(
+                error="İlan metninden anlamlı anahtar kelime (isim, sıfat, fiil) çıkarılamadı. Daha detaylı bir ilan metni kullanın."))
+
+        # 3. Alt Puanları Hesaplama
+        keyword_score, matching_keywords, missing_keywords = calculate_similarity_score(cv_keywords, job_keywords)
+        structural_score = calculate_structural_score(raw_cv_text)
+
+        # 4. Nihai Puanı Hesaplama (Ağırlıklandırma)
+        # İçerik daha önemli olduğu için %80, Yapısal Puan (Görüntü Simülasyonu) %20 ağırlık veriyoruz.
+        final_score = round((keyword_score * 0.80) + (structural_score * 0.20), 2)
+
+        # 5. Sonuçları Sunma (Doğrudan HTML stringi döndür)
+        content = generate_result_content(final_score, keyword_score, structural_score, matching_keywords,
+                                          missing_keywords)
+        return generate_base_html(content)
+
+    except Exception as e:
+        print(f"Genel analiz hatası: {e}")
+        return generate_base_html(generate_index_content(error=f"Analiz sırasında beklenmeyen bir hata oluştu: {e}"))
+    finally:
+        # Geçici dosyayı siliyoruz
+        os.remove(temp_path)
+
+
+if __name__ == '__main__':
+    print("--- CV Analiz Sistemi Başlatılıyor ---")
+    app.run(debug=True)
